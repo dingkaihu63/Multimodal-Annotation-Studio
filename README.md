@@ -57,6 +57,39 @@ conda run -n python3.10 python -m unittest -v
 
 测试覆盖 Schema 兼容与校验、时间戳解析、主轨对齐、打板校正、分组多标签、草稿原子恢复、质量检查、边界标签以及 HDF5 单选/多热导出。
 
+## 致谢
+
+本项目建立在多个优秀的开源项目之上。感谢以下项目及其贡献者：
+
+- [Streamlit](https://github.com/streamlit/streamlit) 提供交互式应用框架；
+- [Plotly.py](https://github.com/plotly/plotly.py) 提供多轨时间序列可视化；
+- [pandas](https://github.com/pandas-dev/pandas) 和 [NumPy](https://github.com/numpy/numpy) 提供数据处理、时间戳对齐与数值计算能力；
+- [ruptures](https://github.com/deepcharles/ruptures) 提供时间序列变点检测算法；
+- [h5py](https://github.com/h5py/h5py) 提供 HDF5 数据集读写能力；
+- [OpenCV](https://github.com/opencv/opencv)、[Pillow](https://github.com/python-pillow/Pillow) 和 [PyYAML](https://github.com/yaml/pyyaml) 分别支持图像处理、图像预览和 Schema 配置；
+- [OpenAI Python SDK](https://github.com/openai/openai-python) 提供 OpenAI 兼容模型接口客户端。
+
+项目的工作流和界面设计还参考了 [Label Studio](https://github.com/HumanSignal/label-studio)、[CVAT](https://github.com/cvat-ai/cvat)、[BORIS](https://github.com/olivierfriard/BORIS) 和 [PlotJuggler](https://github.com/PlotJuggler/PlotJuggler)。这些项目在通用数据标注、视觉标注、行为事件记录和时间序列分析方面提供了重要启发。
+
+上述项目的版权归各自作者所有，并分别遵循其自身的开源协议。本项目对它们的致谢不表示这些项目的作者为本项目提供背书。
+
+## 引用
+
+如果本项目对研究或工程工作有帮助，请在论文、报告或项目文档中引用：
+
+```bibtex
+@misc{dingkaihu63_2026_multimodal_annotation_studio,
+  author       = {{dingkaihu63}},
+  title        = {Multimodal Annotation Studio},
+  year         = {2026},
+  howpublished = {GitHub repository},
+  url          = {https://github.com/dingkaihu63/Multimodal-Annotation-Studio},
+  note         = {MIT licensed software}
+}
+```
+
+引用具体发布版本时，建议同时注明所使用的 Git 提交哈希或 GitHub Release 版本号，以保证结果可复现。
+
 ## 开源协议
 
 本项目采用 [MIT License](LICENSE) 开源协议。

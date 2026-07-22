@@ -115,6 +115,59 @@ encoding.
 
 The complete Chinese user guide is available in [使用说明.md](使用说明.md).
 
+## Acknowledgements
+
+This project is built on the work of many open-source communities. We thank the
+following projects and their contributors:
+
+- [Streamlit](https://github.com/streamlit/streamlit) for the interactive
+  application framework;
+- [Plotly.py](https://github.com/plotly/plotly.py) for multi-track time-series
+  visualization;
+- [pandas](https://github.com/pandas-dev/pandas) and
+  [NumPy](https://github.com/numpy/numpy) for data processing, timestamp
+  alignment, and numerical computation;
+- [ruptures](https://github.com/deepcharles/ruptures) for time-series
+  change-point detection;
+- [h5py](https://github.com/h5py/h5py) for HDF5 dataset support;
+- [OpenCV](https://github.com/opencv/opencv),
+  [Pillow](https://github.com/python-pillow/Pillow), and
+  [PyYAML](https://github.com/yaml/pyyaml) for image processing, image preview,
+  and schema configuration;
+- [OpenAI Python SDK](https://github.com/openai/openai-python) for the
+  OpenAI-compatible model client.
+
+The workflow and interface design were also informed by
+[Label Studio](https://github.com/HumanSignal/label-studio),
+[CVAT](https://github.com/cvat-ai/cvat),
+[BORIS](https://github.com/olivierfriard/BORIS), and
+[PlotJuggler](https://github.com/PlotJuggler/PlotJuggler). Their work on general
+data labeling, visual annotation, behavioral event logging, and time-series
+analysis provided valuable inspiration.
+
+Copyright in the projects listed above remains with their respective authors,
+and each project is distributed under its own license. Acknowledgement does not
+imply endorsement of this project by those authors or organizations.
+
+## Citation
+
+If this project supports your research or engineering work, please cite it in
+papers, reports, or project documentation:
+
+```bibtex
+@misc{dingkaihu63_2026_multimodal_annotation_studio,
+  author       = {{dingkaihu63}},
+  title        = {Multimodal Annotation Studio},
+  year         = {2026},
+  howpublished = {GitHub repository},
+  url          = {https://github.com/dingkaihu63/Multimodal-Annotation-Studio},
+  note         = {MIT licensed software}
+}
+```
+
+For reproducible work, include the Git commit hash or GitHub Release version
+used in your experiments.
+
 ## License
 
 This project is released under the [MIT License](LICENSE).
