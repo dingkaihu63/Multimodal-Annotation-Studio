@@ -1,0 +1,136 @@
+# 多模态传感器 Schema 配置示例
+# 用于动态定义设备、数据列、时间戳和插值策略
+# 所有字段均可在 app.py 侧边栏中通过 Sensor Schema Editor 动态修改
+
+# 主设备（主轨）：作为时间对齐的主帧
+master_device: rgbd_camera
+
+# 设备列表
+devices:
+  # ============ RGB-D 相机（主设备，30Hz） ============
+  - name: rgbd_camera
+    type: image               # image | numeric | mixed
+    frequency_hz: 30.0
+    data_path: data/rgb/      # 图像目录路径（按帧命名）
+    depth_path: data/depth/  # 深度图目录（可选）
+    timestamp_file: data/rgb_timestamps.csv  # 时间戳文件
+    timestamp_column: timestamp
+    image_column: filename
+    interpolation: nearest    # 图像默认最近邻
+
+  # ============ 足底压力传感器 FSR（100Hz） ============
+  - name: fsr_insole
+    type: numeric
+    frequency_hz: 100.0
+    data_path: data/fsr_insole.csv
+    timestamp_column: timestamp
+    value_columns:
+      - heel_left
+      - heel_right
+      - mid_left
+      - mid_right
+      - fore_left
+      - fore_right
+    interpolation: linear     # 压力数据线性插值
+
+  # ============ IMU 惯性测量单元（200Hz） ============
+  - name: imu_thigh
+    type: numeric
+    frequency_hz: 200.0
+    data_path: data/imu_thigh.csv
+    timestamp_column: timestamp
+    value_columns:
+      - accel_x
+      - accel_y
+      - accel_z
+      - gyro_x
+      - gyro_y
+      - gyro_z
+    interpolation: linear
+
+  # ============ 超声波测距（50Hz） ============
+  - name: ultrasonic
+    type: numeric
+    frequency_hz: 50.0
+    data_path: data/ultrasonic.csv
+    timestamp_column: timestamp
+    value_columns:
+      - distance
+    interpolation: forward_fill  # 前向填充
+
+# ============ 标签组与标签定义 ============
+# single: 同一帧在该组中只能有一个标签；multi: 同一帧可同时有多个标签
+label_groups:
+  - name: 地形
+    mode: single
+  - name: 动作
+    mode: single
+  - name: 步态阶段
+    mode: single
+  - name: 事件
+    mode: multi
+
+label_classes:
+  - name: 平地
+    color: "#2ECC71"
+    group: 地形
+  - name: 坡道
+    color: "#F39C12"
+    group: 地形
+  - name: 楼梯
+    color: "#E74C3C"
+    group: 地形
+  - name: 草地
+    color: "#3498DB"
+    group: 地形
+  - name: 沙地
+    color: "#9B59B6"
+    group: 地形
+  - name: 站立
+    color: "#607D8B"
+    group: 动作
+  - name: 行走
+    color: "#00897B"
+    group: 动作
+  - name: 上楼
+    color: "#5C6BC0"
+    group: 动作
+  - name: 下楼
+    color: "#7E57C2"
+    group: 动作
+  - name: 支撑期
+    color: "#3949AB"
+    group: 步态阶段
+  - name: 摆动期
+    color: "#00ACC1"
+    group: 步态阶段
+  - name: 打滑
+    color: "#D81B60"
+    group: 事件
+  - name: 遮挡
+    color: "#6D4C41"
+    group: 事件
+  - name: 异常
+    color: "#C62828"
+    group: 事件
+
+# 边界过渡区设置
+boundary:
+  enabled: true
+  margin_seconds: 0.5          # 区间交界处 ±0.5s 标记为 Ignore
+  ignore_label: Ignore
+
+# 变点检测配置
+change_point_detection:
+  algorithm: pelt              # pelt | binseg | window | bottomup
+  model: rbf                   # l1 | l2 | rbf | normal | ar
+  min_size: 30                 # 最短区间样本数
+  jump: 5                      # 下采样因子（性能优化）
+
+# LLM 辅助配置
+llm_assistant:
+  enabled: false
+  api_key: ""
+  base_url: ""                 # 留空则使用 OpenAI 官方
+  model: "gpt-4o"
+  temperature: 0.2

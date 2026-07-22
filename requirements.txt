@@ -1,0 +1,32 @@
+# 多模态数据标注辅助工具 - 依赖列表
+# Python 3.10+
+
+# Web 应用框架
+streamlit>=1.45.0
+streamlit-shortcuts>=1.2.1
+
+# 交互式图表
+plotly>=5.18.0
+
+# 数据处理
+pandas>=2.1.0
+numpy>=1.26.0
+
+# 配置文件解析
+PyYAML>=6.0.1
+
+# 变点检测
+ruptures>=1.1.8
+
+# LLM/VLM API 调用
+openai>=1.12.0
+
+# 图像处理（RGB-D 预览）
+Pillow>=10.2.0
+opencv-python-headless>=4.9.0.80
+
+# 数据集导出
+h5py>=3.10.0
+
+# 点云处理（可选，RGB-D 扩展）
+# open3d>=0.18.0
