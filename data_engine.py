@@ -24,7 +24,9 @@ import io
 import json
 import time
 import base64
+import uuid
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -81,6 +83,7 @@ class SensorSchema:
     label_classes: list[dict] = field(default_factory=list)
     boundary: dict = field(default_factory=dict)
     change_point_detection: dict = field(default_factory=dict)
+    training_export: dict = field(default_factory=dict)
     llm_assistant: dict = field(default_factory=dict)
 
     @classmethod
@@ -99,6 +102,7 @@ class SensorSchema:
             label_classes=label_classes,
             boundary=d.get("boundary", {}),
             change_point_detection=d.get("change_point_detection", {}),
+            training_export=d.get("training_export", {}),
             llm_assistant=d.get("llm_assistant", {}),
         )
 
@@ -122,6 +126,7 @@ class SensorSchema:
             "label_classes": self.label_classes,
             "boundary": self.boundary,
             "change_point_detection": self.change_point_detection,
+            "training_export": self.training_export,
             "llm_assistant": llm_config,
         }
 
@@ -209,7 +214,9 @@ class SensorSchema:
         return None
 
     @staticmethod
-    def label_column(group_name: str) -> str:
+    def label_column(group_name: str, layer: str | None = None) -> str:
+        if layer is not None:
+            return f"{layer}_label__{group_name}"
         return f"label__{group_name}"
 
     def label_color(self, name: str) -> str:
@@ -712,9 +719,15 @@ class IntervalAnnotator:
     - 支持边界过渡区 (±0.5s) 标记为 Ignore
     """
 
-    def __init__(self, schema: SensorSchema):
+    def __init__(
+        self, schema: SensorSchema, annotator: str = "unknown", session_id: str = "",
+    ):
         self.schema = schema
         self.intervals: list[dict] = []
+        self.annotator = annotator.strip() or "unknown"
+        self.session_id = session_id.strip()
+        self.version = 0
+        self.history: list[dict] = []
         bnd = schema.boundary
         self.boundary_enabled = bnd.get("enabled", True)
         self.boundary_margin = float(bnd.get("margin_seconds", 0.5))
@@ -725,6 +738,11 @@ class IntervalAnnotator:
         start_time, end_time, label: str | list[str],
         df: pd.DataFrame | None = None,
         group: str | None = None,
+        layer: str = "verified",
+        annotator: str | None = None,
+        source: str = "manual",
+        confidence: float | None = None,
+        record_history: bool = True,
     ) -> dict:
         """添加一个标注区间。"""
         start = pd.Timestamp(start_time)
@@ -750,12 +768,24 @@ class IntervalAnnotator:
         mode = self.schema.label_group_mode(resolved_group)
         if mode == "single" and len(labels) != 1:
             raise ValueError(f"单选标签组 '{resolved_group}' 只能选择一个标签")
+        if layer not in {"planned", "verified"}:
+            raise ValueError("标注层必须是 planned 或 verified")
+        now = datetime.now(timezone.utc).isoformat()
+        interval_annotator = (annotator or self.annotator).strip() or "unknown"
         interval = {
+            "annotation_id": uuid.uuid4().hex,
             "start_time": start,
             "end_time": end,
             "group": resolved_group,
             "labels": labels,
             "label": " + ".join(labels),
+            "layer": layer,
+            "annotator": interval_annotator,
+            "source": source.strip() or "manual",
+            "confidence": None if confidence is None else float(confidence),
+            "version": self.version + 1 if record_history else self.version,
+            "created_at": now,
+            "updated_at": now,
             "color": self.schema.label_color(labels[0]),
             # Keep creation order separate from chronological display order so a
             # later single-select annotation reliably overwrites an older one.
@@ -771,13 +801,51 @@ class IntervalAnnotator:
             interval["frame_count"] = int(mask.sum())
         self.intervals.append(interval)
         self.intervals.sort(key=lambda item: item["start_time"])
+        if record_history:
+            self._record_history("add", interval_annotator, after=interval)
         return interval
 
-    def remove_interval(self, idx: int) -> None:
-        if 0 <= idx < len(self.intervals):
-            self.intervals.pop(idx)
+    @staticmethod
+    def _serialize_interval(interval: dict | None) -> dict | None:
+        if interval is None:
+            return None
+        item = dict(interval)
+        item.pop("_order", None)
+        for key in ("start_time", "end_time"):
+            if key in item:
+                item[key] = pd.Timestamp(item[key]).isoformat()
+        return item
 
-    def clear(self) -> None:
+    def _record_history(
+        self,
+        action: str,
+        annotator: str | None = None,
+        before: dict | None = None,
+        after: dict | None = None,
+    ) -> None:
+        self.version += 1
+        payload = after or before or {}
+        self.history.append({
+            "version": self.version,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "annotator": (annotator or self.annotator).strip() or "unknown",
+            "action": action,
+            "annotation_id": str(payload.get("annotation_id", "")),
+            "before": self._serialize_interval(before),
+            "after": self._serialize_interval(after),
+        })
+
+    def remove_interval(self, idx: int, annotator: str | None = None) -> None:
+        if 0 <= idx < len(self.intervals):
+            removed = self.intervals.pop(idx)
+            self._record_history("remove", annotator, before=removed)
+
+    def clear(self, annotator: str | None = None) -> None:
+        if self.intervals:
+            self._record_history(
+                "clear", annotator,
+                before={"interval_count": len(self.intervals)},
+            )
         self.intervals.clear()
 
     def load_list(
@@ -790,7 +858,9 @@ class IntervalAnnotator:
         if not isinstance(intervals, list):
             raise ValueError("标注草稿中的 intervals 必须是列表")
 
-        candidate = IntervalAnnotator(self.schema)
+        candidate = IntervalAnnotator(
+            self.schema, annotator=self.annotator, session_id=self.session_id
+        )
         source_items = ([] if replace else self.to_list()) + intervals
         for index, item in enumerate(source_items):
             if not isinstance(item, dict):
@@ -805,11 +875,28 @@ class IntervalAnnotator:
                     labels,
                     df,
                     group=item.get("group"),
+                    layer=item.get("layer", "verified"),
+                    annotator=item.get("annotator", self.annotator),
+                    source=item.get("source", "import"),
+                    confidence=item.get("confidence"),
+                    record_history=False,
                 )
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"第 {index + 1} 个标注区间无效: {exc}") from exc
+            restored = candidate.intervals[-1]
+            for key in (
+                "annotation_id", "version", "created_at", "updated_at",
+            ):
+                if item.get(key) is not None:
+                    restored[key] = item[key]
 
+        previous_count = len(self.intervals)
         self.intervals = candidate.intervals
+        self._record_history(
+            "restore" if replace else "merge",
+            before={"interval_count": previous_count},
+            after={"interval_count": len(self.intervals), "imported": len(intervals)},
+        )
         return len(intervals)
 
     def _interval_group(self, interval: dict) -> str:
@@ -827,7 +914,10 @@ class IntervalAnnotator:
         label = str(interval.get("label", "")).strip()
         return [label] if label else []
 
-    def annotation_stats(self, df: pd.DataFrame, group: str | None = None) -> dict:
+    def annotation_stats(
+        self, df: pd.DataFrame, group: str | None = None,
+        layer: str | None = None,
+    ) -> dict:
         """Return frame-level annotation coverage and per-label counts."""
         total_frames = len(df)
         if total_frames == 0:
@@ -842,7 +932,7 @@ class IntervalAnnotator:
 
         resolved_group = group or self.schema.default_label_group()
         labeled_df = self.apply_to_dataframe(df)
-        group_column = self.schema.label_column(resolved_group)
+        group_column = self.schema.label_column(resolved_group, layer)
         labels = labeled_df.get(
             group_column, pd.Series("", index=labeled_df.index, dtype="object")
         ).fillna("").astype(str).str.strip()
@@ -868,6 +958,7 @@ class IntervalAnnotator:
 
     def next_unlabeled_interval(
         self, df: pd.DataFrame, after_time=None, group: str | None = None,
+        layer: str | None = None,
     ) -> tuple[pd.Timestamp, pd.Timestamp] | None:
         """Find the next contiguous unlabeled run, wrapping at the dataset end."""
         if df.empty or "timestamp" not in df.columns:
@@ -876,7 +967,9 @@ class IntervalAnnotator:
         labeled_df = self.apply_to_dataframe(df).reset_index(drop=True)
         timestamps = pd.to_datetime(labeled_df["timestamp"], errors="coerce")
         resolved_group = group or self.schema.default_label_group()
-        labels = labeled_df[self.schema.label_column(resolved_group)].fillna("").astype(str).str.strip()
+        labels = labeled_df[
+            self.schema.label_column(resolved_group, layer)
+        ].fillna("").astype(str).str.strip()
         unlabeled = labels.eq("") & timestamps.notna()
         positions = np.flatnonzero(unlabeled.to_numpy())
         if not len(positions):
@@ -973,6 +1066,8 @@ class IntervalAnnotator:
             ]
             for left_pos, (left_index, left) in enumerate(group_intervals):
                 for right_index, right in group_intervals[left_pos + 1:]:
+                    if left.get("layer", "verified") != right.get("layer", "verified"):
+                        continue
                     overlap_start = max(left["start_time"], right["start_time"])
                     overlap_end = min(left["end_time"], right["end_time"])
                     if overlap_start >= overlap_end:
@@ -998,34 +1093,37 @@ class IntervalAnnotator:
         return issues
 
     def apply_to_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        将所有区间标签按标签组填充到 DataFrame，并保留默认组的 ``label`` 兼容列。
-
-        边界过渡区: 相邻区间交界处 ±margin 的帧标记为 Ignore。
-        """
+        """Apply planned and verified intervals and derive effective labels."""
         result = df.copy()
         if "timestamp" not in result.columns:
             return result
-        group_names = self.schema.label_group_names()
-        if not group_names:
-            group_names = [self.schema.default_label_group()]
+        group_names = self.schema.label_group_names() or [
+            self.schema.default_label_group()
+        ]
         for group_name in group_names:
+            for layer in ("planned", "verified"):
+                result[self.schema.label_column(group_name, layer)] = ""
             result[self.schema.label_column(group_name)] = ""
+            result[f"boundary__{group_name}"] = np.uint8(0)
         margin = pd.Timedelta(seconds=self.boundary_margin)
 
-        for iv in sorted(
-            self.intervals,
-            key=lambda item: int(item.get("_order", self.intervals.index(item))),
-        ):
-            group_name = self._interval_group(iv)
+        ordered_intervals = sorted(
+            enumerate(self.intervals),
+            key=lambda pair: int(pair[1].get("_order", pair[0])),
+        )
+        for _, interval in ordered_intervals:
+            group_name = self._interval_group(interval)
             if group_name not in group_names:
                 continue
-            labels = self._interval_labels(iv)
+            labels = self._interval_labels(interval)
             if not labels:
                 continue
-            group_column = self.schema.label_column(group_name)
-            mask = (result["timestamp"] >= iv["start_time"]) & (
-                result["timestamp"] <= iv["end_time"]
+            layer = str(interval.get("layer", "verified"))
+            if layer not in {"planned", "verified"}:
+                continue
+            group_column = self.schema.label_column(group_name, layer)
+            mask = (result["timestamp"] >= interval["start_time"]) & (
+                result["timestamp"] <= interval["end_time"]
             )
             if self.schema.label_group_mode(group_name) == "multi":
                 def merge_labels(current: str) -> str:
@@ -1041,7 +1139,6 @@ class IntervalAnnotator:
             else:
                 result.loc[mask, group_column] = labels[0]
 
-        # 单选组分别计算边界过渡区，避免一个组覆盖另一个组的标签。
         if self.boundary_enabled and len(self.intervals) > 1:
             sample_step = (
                 result["timestamp"].sort_values().diff().dropna().median()
@@ -1050,35 +1147,52 @@ class IntervalAnnotator:
             for group_name in group_names:
                 if self.schema.label_group_mode(group_name) != "single":
                     continue
-                group_intervals = sorted(
-                    [
-                        interval for interval in self.intervals
-                        if self._interval_group(interval) == group_name
-                    ],
-                    key=lambda item: item["start_time"],
-                )
-                for i in range(len(group_intervals) - 1):
-                    current = group_intervals[i]
-                    following = group_intervals[i + 1]
-                    if self._interval_labels(current) == self._interval_labels(following):
-                        continue
-                    gap = following["start_time"] - current["end_time"]
-                    if gap > max(sample_step * 2, pd.Timedelta(milliseconds=1)):
-                        continue
-                    boundary_time = current["end_time"] + gap / 2
-                    left = boundary_time - margin
-                    right = boundary_time + margin
-                    mask = (result["timestamp"] >= left) & (
-                        result["timestamp"] <= right
+                for layer in ("planned", "verified"):
+                    group_intervals = sorted(
+                        [
+                            interval for interval in self.intervals
+                            if self._interval_group(interval) == group_name
+                            and interval.get("layer", "verified") == layer
+                        ],
+                        key=lambda item: item["start_time"],
                     )
-                    result.loc[
-                        mask, self.schema.label_column(group_name)
-                    ] = self.ignore_label
+                    for index in range(len(group_intervals) - 1):
+                        current = group_intervals[index]
+                        following = group_intervals[index + 1]
+                        if self._interval_labels(current) == self._interval_labels(following):
+                            continue
+                        gap = following["start_time"] - current["end_time"]
+                        if gap > max(sample_step * 2, pd.Timedelta(milliseconds=1)):
+                            continue
+                        boundary_time = current["end_time"] + gap / 2
+                        mask = (
+                            result["timestamp"] >= boundary_time - margin
+                        ) & (result["timestamp"] <= boundary_time + margin)
+                        result.loc[
+                            mask, self.schema.label_column(group_name, layer)
+                        ] = self.ignore_label
 
-        default_column = self.schema.label_column(self.schema.default_label_group())
-        result["label"] = result.get(
-            default_column, pd.Series("", index=result.index, dtype="object")
-        )
+        for group_name in group_names:
+            planned = result[self.schema.label_column(group_name, "planned")]
+            verified = result[self.schema.label_column(group_name, "verified")]
+            effective = verified.where(verified.astype(str).str.strip().ne(""), planned)
+            result[self.schema.label_column(group_name)] = effective
+            previous = effective.shift(1).fillna("")
+            transition = (
+                effective.astype(str).str.strip().ne("")
+                & previous.astype(str).str.strip().ne("")
+                & effective.ne(previous)
+            )
+            result[f"boundary__{group_name}"] = transition.astype(np.uint8)
+
+        default_group = self.schema.default_label_group()
+        result["planned_label"] = result[
+            self.schema.label_column(default_group, "planned")
+        ]
+        result["verified_label"] = result[
+            self.schema.label_column(default_group, "verified")
+        ]
+        result["label"] = result[self.schema.label_column(default_group)]
         return result
 
     def to_list(self) -> list[dict]:
@@ -1091,6 +1205,38 @@ class IntervalAnnotator:
             item["end_time"] = pd.Timestamp(iv["end_time"]).isoformat()
             out.append(item)
         return out
+
+    def to_document(self, metadata: dict | None = None) -> dict:
+        return {
+            "format": "multimodal-annotation-document",
+            "version": self.version,
+            "session_id": self.session_id,
+            "annotator": self.annotator,
+            "metadata": dict(metadata or {}),
+            "intervals": self.to_list(),
+            "history": list(self.history),
+        }
+
+    def load_document(
+        self, document: dict, df: pd.DataFrame | None = None,
+        replace: bool = True,
+    ) -> int:
+        if not isinstance(document, dict):
+            raise ValueError("标注文档必须是对象")
+        intervals = document.get("intervals")
+        count = self.load_list(intervals, df, replace=replace)
+        if replace:
+            self.session_id = str(document.get("session_id", self.session_id))
+            self.annotator = str(document.get("annotator", self.annotator)) or "unknown"
+            restored_history = document.get("history", [])
+            if isinstance(restored_history, list):
+                self.history = list(restored_history)
+            self.version = max(
+                int(document.get("version", 0) or 0),
+                max((int(item.get("version", 0)) for item in self.history), default=0),
+            )
+            self._record_history("restore_document")
+        return count
 
 
 # =============================================================================
@@ -1410,6 +1556,17 @@ class Exporter:
                 ig.attrs["labels"] = json.dumps(
                     iv.get("labels", [iv.get("label", "")]), ensure_ascii=False
                 )
+                ig.attrs["annotation_id"] = str(iv.get("annotation_id", ""))
+                ig.attrs["layer"] = str(iv.get("layer", "verified"))
+                ig.attrs["annotator"] = str(iv.get("annotator", "unknown"))
+                ig.attrs["source"] = str(iv.get("source", "manual"))
+                confidence = iv.get("confidence")
+                ig.attrs["confidence"] = (
+                    float(confidence) if confidence is not None else float("nan")
+                )
+                ig.attrs["version"] = int(iv.get("version", 0))
+                ig.attrs["created_at"] = str(iv.get("created_at", ""))
+                ig.attrs["updated_at"] = str(iv.get("updated_at", ""))
 
             # Schema (JSON)
             schema_json = json.dumps(schema.to_dict(), ensure_ascii=False)

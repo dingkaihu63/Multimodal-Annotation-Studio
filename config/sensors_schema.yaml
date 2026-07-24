@@ -63,11 +63,17 @@ devices:
 label_groups:
   - name: 地形
     mode: single
+  - name: 表面
+    mode: single
   - name: 动作
     mode: single
   - name: 步态阶段
     mode: single
-  - name: 事件
+  - name: 操作事件
+    mode: multi
+  - name: 有效性
+    mode: single
+  - name: 质量异常
     mode: multi
 
 label_classes:
@@ -86,6 +92,21 @@ label_classes:
   - name: 沙地
     color: "#9B59B6"
     group: 地形
+  - name: 硬质
+    color: "#455A64"
+    group: 表面
+  - name: 柔软
+    color: "#26A69A"
+    group: 表面
+  - name: 湿滑
+    color: "#039BE5"
+    group: 表面
+  - name: 粗糙
+    color: "#8D6E63"
+    group: 表面
+  - name: 未知
+    color: "#90A4AE"
+    group: 表面
   - name: 站立
     color: "#607D8B"
     group: 动作
@@ -104,15 +125,50 @@ label_classes:
   - name: 摆动期
     color: "#00ACC1"
     group: 步态阶段
-  - name: 打滑
-    color: "#D81B60"
-    group: 事件
+  - name: 动作起点
+    color: "#1565C0"
+    group: 操作事件
+  - name: 确认
+    color: "#2E7D32"
+    group: 操作事件
+  - name: 停止
+    color: "#C62828"
+    group: 操作事件
+  - name: 取消
+    color: "#616161"
+    group: 操作事件
+  - name: 有效
+    color: "#2E7D32"
+    group: 有效性
+  - name: 无效
+    color: "#C62828"
+    group: 有效性
+  - name: 丢帧
+    color: "#D32F2F"
+    group: 质量异常
   - name: 遮挡
     color: "#6D4C41"
-    group: 事件
-  - name: 异常
-    color: "#C62828"
-    group: 事件
+    group: 质量异常
+  - name: 漂移
+    color: "#F57C00"
+    group: 质量异常
+  - name: 噪声
+    color: "#7B1FA2"
+    group: 质量异常
+  - name: 传感器饱和
+    color: "#AD1457"
+    group: 质量异常
+
+# 训练代码使用的稳定字段与界面标签组映射
+training_export:
+  group_mapping:
+    terrain: 地形
+    surface: 表面
+    action: 动作
+    gait_phase: 步态阶段
+    operation_event: 操作事件
+    validity: 有效性
+    quality: 质量异常
 
 # 边界过渡区设置
 boundary:

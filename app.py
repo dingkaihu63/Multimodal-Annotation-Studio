@@ -40,6 +40,12 @@ from data_engine import (
     LLMAssistant, Exporter,
 )
 from timeline_ui import TimelineRenderer, ImagePreviewRenderer
+from workflow_engine import (
+    GaitPreAnnotator,
+    QualityPreAnnotator,
+    SessionCatalog,
+    TrainingExporter,
+)
 
 
 # =============================================================================
@@ -77,6 +83,8 @@ else:
 # the next run. Applying queued values here keeps both views in sync without
 # mutating an already-instantiated Streamlit widget.
 for widget_key, widget_value in st.session_state.pop("_settings_widget_sync", {}).items():
+    st.session_state[widget_key] = widget_value
+for widget_key, widget_value in st.session_state.pop("_device_widget_sync", {}).items():
     st.session_state[widget_key] = widget_value
 
 
@@ -183,6 +191,8 @@ st.markdown(
     [data-testid="stTabs"] [aria-selected="true"] {{color: var(--studio-text);}}
     .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{border-radius: 6px; border-color: var(--studio-border); box-shadow: none;}}
     .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {{background: var(--studio-text); border-color: var(--studio-text); color: white;}}
+    .stButton > button[kind="primary"] p, .stButton > button[kind="primary"] [data-testid="stIconMaterial"],
+    .stFormSubmitButton > button[kind="primary"] p, .stFormSubmitButton > button[kind="primary"] [data-testid="stIconMaterial"] {{color: #ffffff !important;}}
     .stButton > button:hover, .stDownloadButton > button:hover {{border-color: #a8a8a3; color: var(--studio-text);}}
     [data-baseweb="input"] > div, [data-baseweb="select"] > div, [data-baseweb="textarea"] > div {{border-radius: 6px !important; border-color: var(--studio-border) !important;}}
     [data-testid="stExpander"] {{background: var(--studio-surface); border-color: var(--studio-border); border-radius: 6px;}}
@@ -333,6 +343,20 @@ def init_state():
         st.session_state.schema_signature = _schema_signature(
             st.session_state.schema, include_llm=False
         )
+    if "session_catalog" not in st.session_state:
+        st.session_state.session_catalog = None
+    if "active_session_id" not in st.session_state:
+        st.session_state.active_session_id = ""
+    if "session_annotations" not in st.session_state:
+        st.session_state.session_annotations = {}
+    if "session_metadata" not in st.session_state:
+        st.session_state.session_metadata = {}
+    if "annotator_name" not in st.session_state:
+        st.session_state.annotator_name = ""
+    if "base_schema" not in st.session_state:
+        st.session_state.base_schema = SensorSchema.from_dict(
+            st.session_state.schema.to_dict(include_secrets=True)
+        )
 
 
 def _schema_signature(schema: SensorSchema, include_llm: bool = True) -> str:
@@ -346,6 +370,7 @@ def sync_engine(clear_data: bool = False, clear_alignment: bool = False):
     """当 Schema 变化时, 重建 engine 并同步 annotator/llm。"""
     schema = st.session_state.schema
     old_intervals = [] if clear_alignment else st.session_state.intervals
+    old_annotator = st.session_state.engine.annotator
     if clear_data:
         st.session_state.device_data = {}
     if clear_alignment:
@@ -360,6 +385,11 @@ def sync_engine(clear_data: bool = False, clear_alignment: bool = False):
     engine.load_all(st.session_state.device_data)
     engine.aligned_df = st.session_state.aligned_df
     engine.annotator.intervals = old_intervals
+    if not clear_alignment:
+        engine.annotator.annotator = old_annotator.annotator
+        engine.annotator.session_id = old_annotator.session_id
+        engine.annotator.version = old_annotator.version
+        engine.annotator.history = list(old_annotator.history)
     st.session_state.engine = engine
     st.session_state.schema_signature = _schema_signature(schema, include_llm=False)
 
@@ -383,6 +413,112 @@ def safe_extract_zip(payload: bytes, target_dir: str) -> tuple[str, str | None]:
         raise ValueError("ZIP 中未找到 PNG/JPG 图像")
     common_dir = Path(os.path.commonpath([str(path.parent) for path in image_files]))
     return str(common_dir), str(csv_files[0]) if csv_files else None
+
+
+def safe_extract_session_zip(payload: bytes) -> tuple[Path, Path]:
+    """Extract a Session package and locate its manifest CSV."""
+    digest = hashlib.sha256(payload).hexdigest()[:16]
+    root = (Path("data") / "session_imports" / digest).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        for member in archive.infolist():
+            destination = (root / member.filename).resolve()
+            if root != destination and root not in destination.parents:
+                raise ValueError(f"ZIP 包含非法路径: {member.filename}")
+        archive.extractall(root)
+    csv_files = sorted(root.rglob("*.csv"))
+    manifests = [
+        path for path in csv_files
+        if path.name.lower() in {"sessions.csv", "session_manifest.csv", "manifest.csv"}
+    ]
+    if not manifests:
+        for path in csv_files:
+            try:
+                if {"session_id", "device", "data_path"}.issubset(
+                    pd.read_csv(path, nrows=1).columns
+                ):
+                    manifests.append(path)
+                    break
+            except Exception:
+                continue
+    if not manifests:
+        raise ValueError("Session ZIP 中未找到包含 session_id/device/data_path 的清单 CSV")
+    return root, manifests[0]
+
+
+def save_active_session_document() -> None:
+    session_id = st.session_state.get("active_session_id", "")
+    if not session_id or "engine" not in st.session_state:
+        return
+    metadata = dict(st.session_state.get("session_metadata", {}))
+    st.session_state.session_annotations[session_id] = (
+        st.session_state.engine.annotator.to_document(metadata)
+    )
+
+
+def activate_session(session_id: str) -> None:
+    """Load, align, and restore one catalog Session."""
+    catalog = st.session_state.session_catalog
+    if catalog is None:
+        raise ValueError("请先导入 Session 清单")
+    save_active_session_document()
+    base_schema = st.session_state.base_schema
+    session_schema, device_data = catalog.load_session(base_schema, session_id)
+    engine = DataEngine(session_schema)
+    engine.load_all(device_data)
+    aligned = engine.align(float(st.session_state.ui_settings["alignment_tolerance"]))
+    record = catalog.get(session_id)
+    annotator_name = st.session_state.get("annotator_name", "").strip() or "unknown"
+    engine.annotator.annotator = annotator_name
+    engine.annotator.session_id = session_id
+    document = st.session_state.session_annotations.get(session_id)
+    if document:
+        engine.annotator.load_document(document, aligned, replace=True)
+        engine.annotator.annotator = annotator_name
+    elif (
+        record.planned_label
+        and "地形" in session_schema.label_group_names()
+        and record.planned_label in session_schema.label_names("地形")
+    ):
+        engine.annotator.add_interval(
+            aligned["timestamp"].iloc[0], aligned["timestamp"].iloc[-1],
+            record.planned_label, aligned, group="地形", layer="planned",
+            source="session_manifest", confidence=1.0,
+        )
+
+    st.session_state.schema = session_schema
+    device_widget_sync = {}
+    for index, device in enumerate(session_schema.devices):
+        device_widget_sync.update({
+            f"name_{index}": device.name,
+            f"type_{index}": device.device_type,
+            f"freq_{index}": device.frequency_hz,
+            f"path_{index}": device.data_path,
+            f"ts_{index}": device.timestamp_column,
+            f"vals_{index}": ", ".join(device.value_columns),
+            f"interp_{index}": device.interpolation,
+        })
+        if device.device_type in {"image", "mixed"}:
+            device_widget_sync.update({
+                f"ts_file_{index}": device.timestamp_file,
+                f"img_{index}": device.image_column,
+                f"depth_{index}": device.depth_path,
+            })
+    st.session_state._device_widget_sync = device_widget_sync
+    st.session_state.engine = engine
+    st.session_state.device_data = device_data
+    st.session_state.aligned_df = aligned
+    st.session_state.intervals = engine.annotator.intervals
+    st.session_state.active_session_id = session_id
+    st.session_state.session_metadata = record.metadata()
+    st.session_state.playhead_time = aligned["timestamp"].iloc[0]
+    st.session_state.selection = None
+    st.session_state.change_points = []
+    st.session_state.annotation_undo_stack = []
+    st.session_state.alignment_frame_index = 0
+    st.session_state.schema_signature = _schema_signature(
+        session_schema, include_llm=False
+    )
 
 
 def enable_annotation_shortcuts() -> None:
@@ -1342,12 +1478,128 @@ with st.sidebar:
 # 主区域: Tabs 分区
 # =============================================================================
 
-tab_data, tab_align, tab_annotate, tab_export = st.tabs([
+tab_sessions, tab_data, tab_align, tab_annotate, tab_export = st.tabs([
+    tr("Sessions", "Sessions"),
     tr("数据", "Data"),
     tr("对齐与分割", "Align & segment"),
     tr("标注", "Annotate"),
     tr("导出", "Export"),
 ])
+
+
+# -----------------------------------------------------------------------------
+# Tab 1: Session 批量工作台
+# -----------------------------------------------------------------------------
+
+with tab_sessions:
+    st.header(tr("Session 工作台", "Session workspace"))
+    st.caption(tr(
+        "用一张长表清单批量组织受试者、场景和多传感器文件；每行对应一个 Session 中的一台设备。",
+        "Batch-organize subjects, scenes, and sensor files with one long-form manifest row per device.",
+    ))
+
+    session_left, session_right = st.columns([2, 1])
+    with session_left:
+        manifest_template = SessionCatalog.template(
+            st.session_state.get("base_schema", st.session_state.schema)
+        ).to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            tr("下载 Session 清单模板", "Download Session manifest template"),
+            manifest_template,
+            file_name="session_manifest.csv",
+            mime="text/csv",
+            icon=":material/download:",
+        )
+        session_package = st.file_uploader(
+            tr("导入清单 CSV 或 Session ZIP", "Import manifest CSV or Session ZIP"),
+            type=["csv", "zip"],
+            key="session_manifest_upload",
+            help=tr(
+                "ZIP 内应包含 manifest.csv（或 session_manifest.csv）及其相对路径引用的数据文件。",
+                "A ZIP should contain manifest.csv (or session_manifest.csv) and referenced data files.",
+            ),
+        )
+        if session_package is not None:
+            payload = session_package.getvalue()
+            digest = hashlib.sha256(payload).hexdigest()
+            if digest != st.session_state.get("session_manifest_digest"):
+                try:
+                    if session_package.name.lower().endswith(".zip"):
+                        package_root, manifest_path = safe_extract_session_zip(payload)
+                        catalog = SessionCatalog.from_csv(
+                            manifest_path, base_dir=manifest_path.parent
+                        )
+                    else:
+                        catalog = SessionCatalog.from_csv(
+                            io.BytesIO(payload), base_dir=Path.cwd()
+                        )
+                    st.session_state.base_schema = SensorSchema.from_dict(
+                        st.session_state.schema.to_dict(include_secrets=True)
+                    )
+                    st.session_state.session_catalog = catalog
+                    st.session_state.session_manifest_digest = digest
+                    st.session_state.session_annotations = {}
+                    st.success(tr(
+                        f"已导入 {len(catalog.records)} 个 Session",
+                        f"Imported {len(catalog.records)} Sessions",
+                    ))
+                except Exception as exc:
+                    st.error(tr(f"Session 导入失败：{exc}", f"Session import failed: {exc}"))
+
+    with session_right:
+        annotator_name = st.text_input(
+            tr("标注人员", "Annotator"),
+            value=st.session_state.annotator_name,
+            placeholder=tr("姓名或工号", "Name or operator ID"),
+            key="session_annotator_input",
+        )
+        st.session_state.annotator_name = annotator_name.strip()
+        if st.session_state.active_session_id:
+            st.metric(tr("当前 Session", "Active Session"), st.session_state.active_session_id)
+            st.caption(tr(
+                f"标注版本 v{st.session_state.engine.annotator.version} · "
+                f"{len(st.session_state.engine.annotator.history)} 条历史",
+                f"Annotation v{st.session_state.engine.annotator.version} · "
+                f"{len(st.session_state.engine.annotator.history)} history entries",
+            ))
+
+    catalog = st.session_state.session_catalog
+    if catalog is not None:
+        st.divider()
+        session_ids = catalog.session_ids()
+        session_control = st.columns([2, 1, 1], vertical_alignment="bottom")
+        selected_session = session_control[0].selectbox(
+            tr("选择 Session", "Select Session"),
+            session_ids,
+            index=(session_ids.index(st.session_state.active_session_id)
+                   if st.session_state.active_session_id in session_ids else 0),
+        )
+        if session_control[1].button(
+            tr("加载并对齐", "Load and align"),
+            type="primary", icon=":material/play_arrow:",
+            use_container_width=True,
+        ):
+            try:
+                with st.spinner(tr("正在加载多传感器并建立共享时间轴…", "Loading sensors onto a shared timeline…")):
+                    activate_session(selected_session)
+                st.success(tr(
+                    f"{selected_session} 已加载并对齐",
+                    f"{selected_session} loaded and aligned",
+                ))
+                st.rerun()
+            except Exception as exc:
+                st.error(tr(f"Session 加载失败：{exc}", f"Session load failed: {exc}"))
+        record = catalog.get(selected_session)
+        session_control[2].metric(
+            tr("设备", "Devices"), len(record.devices)
+        )
+
+        manifest_view = catalog.to_dataframe().copy()
+        st.dataframe(manifest_view, use_container_width=True, hide_index=True)
+        balance = TrainingExporter.catalog_balance(catalog)
+        if not balance.empty:
+            with st.expander(tr("清单平衡统计", "Manifest balance"), expanded=True):
+                st.dataframe(balance, use_container_width=True, hide_index=True)
 
 
 # -----------------------------------------------------------------------------
@@ -1813,6 +2065,12 @@ with tab_annotate:
         st.warning(tr("请先完成数据对齐", "Align the data before annotating"), icon=":material/info:")
     else:
         df = st.session_state.aligned_df
+        st.session_state.engine.annotator.annotator = (
+            st.session_state.get("annotator_name", "").strip() or "unknown"
+        )
+        st.session_state.engine.annotator.session_id = st.session_state.get(
+            "active_session_id", ""
+        )
         renderer = TimelineRenderer(
             st.session_state.schema,
             language=st.session_state.ui_settings["language"],
@@ -1826,7 +2084,7 @@ with tab_annotate:
         with st.container(key="annotation_toolbar"):
             group_names = st.session_state.schema.label_group_names()
             toolbar = st.columns(
-                [1.25, 2.35, .9, .9, .8, .42], vertical_alignment="bottom"
+                [1.15, .9, 2.15, .8, 1.05, .8, .42], vertical_alignment="bottom"
             )
             selected_group = toolbar[0].selectbox(
                 tr("标签组", "Label group"),
@@ -1834,6 +2092,15 @@ with tab_annotate:
                 index=0 if group_names else None,
                 placeholder=tr("请先添加标签组", "Add a group first"),
                 key="annotation_active_group",
+            )
+            annotation_layer = toolbar[1].selectbox(
+                tr("标注层", "Layer"),
+                ["verified", "planned"],
+                format_func=lambda value: (
+                    tr("已核验", "Verified") if value == "verified"
+                    else tr("计划", "Planned")
+                ),
+                key="annotation_layer",
             )
             group_mode = (
                 st.session_state.schema.label_group_mode(selected_group)
@@ -1844,14 +2111,14 @@ with tab_annotate:
                 if selected_group else []
             )
             if group_mode == "multi":
-                selected_labels = toolbar[1].multiselect(
+                selected_labels = toolbar[2].multiselect(
                     tr("标签（可多选）", "Labels (multiple)"),
                     label_names,
                     placeholder=tr("选择一个或多个标签", "Select one or more labels"),
                     key=f"annotation_labels_{selected_group}",
                 )
             else:
-                selected_label = toolbar[1].selectbox(
+                selected_label = toolbar[2].selectbox(
                     tr("标签", "Label"),
                     label_names,
                     index=0 if label_names else None,
@@ -1860,21 +2127,23 @@ with tab_annotate:
                 )
                 selected_labels = [selected_label] if selected_label else []
 
-            apply_label = toolbar[2].button(
+            apply_label = toolbar[3].button(
                 tr("应用", "Apply"), type="primary", icon=":material/label:",
                 use_container_width=True,
                 disabled=not selected_labels or selected_group is None,
                 key="annotation_apply_label",
             )
-            next_unlabeled = toolbar[3].button(
-                tr("下一空白", "Next gap"), icon=":material/skip_next:",
-                use_container_width=True, key="annotation_next_unlabeled",
+            apply_session = toolbar[4].button(
+                tr("应用全段", "Full Session"), icon=":material/select_all:",
+                use_container_width=True,
+                disabled=not selected_labels or selected_group is None,
+                key="annotation_apply_session",
             )
-            undo_annotation = toolbar[4].button(
+            undo_annotation = toolbar[5].button(
                 tr("撤销", "Undo"), icon=":material/undo:",
                 use_container_width=True, key="annotation_undo",
             )
-            if toolbar[5].button(
+            if toolbar[6].button(
                 tr("管理标签", "Manage labels"), icon=":material/edit:",
                 help=tr("管理标签组和标签", "Manage groups and labels"),
                 use_container_width=True, key="annotation_manage_labels",
@@ -1886,6 +2155,9 @@ with tab_annotate:
                 if sel and sel[0] and sel[1]:
                     iv = st.session_state.engine.annotator.add_interval(
                         sel[0], sel[1], selected_labels, df, group=selected_group,
+                        layer=annotation_layer,
+                        annotator=st.session_state.engine.annotator.annotator,
+                        source="manual",
                     )
                     remember_annotation(iv)
                     st.session_state.intervals = (
@@ -1904,9 +2176,30 @@ with tab_annotate:
                         "Select a timeline range or set in and out points first",
                     ))
 
+            if apply_session:
+                iv = st.session_state.engine.annotator.add_interval(
+                    df["timestamp"].iloc[0], df["timestamp"].iloc[-1],
+                    selected_labels, df, group=selected_group,
+                    layer=annotation_layer,
+                    annotator=st.session_state.engine.annotator.annotator,
+                    source="session_copy",
+                )
+                remember_annotation(iv)
+                st.session_state.intervals = st.session_state.engine.annotator.intervals
+                st.session_state.pending_notice = tr(
+                    f"已将 [{iv['label']}] 复制到完整 Session",
+                    f"Copied [{iv['label']}] to the full Session",
+                )
+                st.rerun()
+
+            next_unlabeled = st.button(
+                tr("定位当前层下一空白区间", "Go to next gap in this layer"),
+                icon=":material/skip_next:", key="annotation_next_unlabeled",
+            )
             if next_unlabeled:
                 next_interval = st.session_state.engine.annotator.next_unlabeled_interval(
                     df, st.session_state.playhead_time, selected_group,
+                    layer=annotation_layer,
                 )
                 if next_interval:
                     st.session_state.selection = next_interval
@@ -1934,7 +2227,7 @@ with tab_annotate:
                     st.info(tr("没有可撤销的标注", "No annotation is available to undo"))
 
             annotation_stats = st.session_state.engine.annotator.annotation_stats(
-                df, selected_group
+                df, selected_group, layer=annotation_layer
             )
             with st.container(key="annotation_status"):
                 status_columns = st.columns(
@@ -1954,6 +2247,86 @@ with tab_annotate:
                     tr("未标注", "Unlabeled"), annotation_stats["unlabeled_frames"]
                 )
                 status_columns[3].metric("Ignore", annotation_stats["ignore_frames"])
+
+            operation_group = "操作事件"
+            operation_labels = set(st.session_state.schema.label_names(operation_group))
+            if operation_group in group_names and st.session_state.playhead_time is not None:
+                st.caption(tr(
+                    "播放指针事件（写入已核验层）",
+                    "Playhead events (saved to the verified layer)",
+                ))
+                event_columns = st.columns(4)
+                for event_column, event_label, event_icon in zip(
+                    event_columns,
+                    ["动作起点", "确认", "停止", "取消"],
+                    ["flag", "check_circle", "stop_circle", "cancel"],
+                ):
+                    if event_column.button(
+                        event_label if st.session_state.ui_settings["language"] == "zh-CN"
+                        else {"动作起点": "Start", "确认": "Confirm", "停止": "Stop", "取消": "Cancel"}[event_label],
+                        icon=f":material/{event_icon}:",
+                        use_container_width=True,
+                        disabled=event_label not in operation_labels,
+                        key=f"quick_event_{event_label}",
+                    ):
+                        iv = st.session_state.engine.annotator.add_interval(
+                            st.session_state.playhead_time,
+                            st.session_state.playhead_time,
+                            event_label, df, group=operation_group,
+                            layer="verified",
+                            annotator=st.session_state.engine.annotator.annotator,
+                            source="playhead_event",
+                        )
+                        remember_annotation(iv)
+                        st.session_state.intervals = st.session_state.engine.annotator.intervals
+                        st.session_state.pending_notice = tr(
+                            f"已记录事件：{event_label}", f"Recorded event: {event_label}"
+                        )
+                        st.rerun()
+
+            prelabel_columns = st.columns([2, 1, 1], vertical_alignment="bottom")
+            fsr_threshold = prelabel_columns[0].slider(
+                tr("足底接触阈值比例", "Foot-contact threshold ratio"),
+                0.05, 0.8, 0.2, 0.05, key="fsr_prelabel_threshold",
+            )
+            gait_exists = any(
+                iv.get("source") == "fsr_auto"
+                for iv in st.session_state.engine.annotator.intervals
+            )
+            quality_exists = any(
+                iv.get("source") == "quality_auto"
+                for iv in st.session_state.engine.annotator.intervals
+            )
+            if prelabel_columns[1].button(
+                tr("预标注步态", "Prelabel gait"), icon=":material/directions_walk:",
+                use_container_width=True, disabled=gait_exists,
+            ):
+                try:
+                    created = GaitPreAnnotator.apply_planned_gait(
+                        df, st.session_state.engine.annotator,
+                        threshold_ratio=fsr_threshold,
+                    )
+                    st.session_state.intervals = st.session_state.engine.annotator.intervals
+                    st.session_state.pending_notice = tr(
+                        f"已生成 {created} 个计划步态区间",
+                        f"Created {created} planned gait intervals",
+                    )
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+            if prelabel_columns[2].button(
+                tr("预标注质量", "Prelabel quality"), icon=":material/rule:",
+                use_container_width=True, disabled=quality_exists,
+            ):
+                created = QualityPreAnnotator.apply_missing_data(
+                    df, st.session_state.engine.annotator
+                )
+                st.session_state.intervals = st.session_state.engine.annotator.intervals
+                st.session_state.pending_notice = tr(
+                    f"已生成 {created} 个计划质量区间",
+                    f"Created {created} planned quality intervals",
+                )
+                st.rerun()
 
         # ============ 左上方: 预览区 ============
         st.subheader(tr("多模态预览", "Multimodal preview"))
@@ -2260,20 +2633,16 @@ with tab_annotate:
             with st.expander(
                 tr("草稿与恢复", "Draft and recovery"), icon=":material/save:"
             ):
-                draft_payload = {
-                    "format": "multimodal-annotation-draft",
-                    "version": 1,
+                draft_payload = st.session_state.engine.annotator.to_document({
+                    **st.session_state.get("session_metadata", {}),
                     "created_at": datetime.now().isoformat(timespec="seconds"),
                     "schema_signature": _schema_signature(
                         st.session_state.schema, include_llm=False
                     ),
-                    "dataset": {
-                        "frames": len(df),
-                        "start_time": str(df["timestamp"].iloc[0]),
-                        "end_time": str(df["timestamp"].iloc[-1]),
-                    },
-                    "intervals": st.session_state.engine.annotator.to_list(),
-                }
+                    "frames": len(df),
+                    "start_time": str(df["timestamp"].iloc[0]),
+                    "end_time": str(df["timestamp"].iloc[-1]),
+                })
                 st.download_button(
                     tr("下载标注草稿", "Download annotation draft"),
                     data=json.dumps(
@@ -2302,17 +2671,21 @@ with tab_annotate:
                         payload = json.loads(
                             draft_file.getvalue().decode("utf-8-sig")
                         )
-                        draft_intervals = (
-                            payload.get("intervals") if isinstance(payload, dict)
-                            else payload
+                        replace_current = restore_mode == tr(
+                            "替换当前标注", "Replace current"
                         )
-                        restored_count = st.session_state.engine.annotator.load_list(
-                            draft_intervals,
-                            df,
-                            replace=restore_mode == tr(
-                                "替换当前标注", "Replace current"
-                            ),
-                        )
+                        if isinstance(payload, dict) and payload.get("history") is not None:
+                            restored_count = st.session_state.engine.annotator.load_document(
+                                payload, df, replace=replace_current
+                            )
+                        else:
+                            draft_intervals = (
+                                payload.get("intervals") if isinstance(payload, dict)
+                                else payload
+                            )
+                            restored_count = st.session_state.engine.annotator.load_list(
+                                draft_intervals, df, replace=replace_current
+                            )
                         st.session_state.intervals = (
                             st.session_state.engine.annotator.intervals
                         )
@@ -2344,6 +2717,25 @@ with tab_annotate:
                         "已清空所有标注", "All annotations cleared"
                     )
                     st.rerun()
+
+        with st.expander(
+            tr("修改历史与版本", "History and version"),
+            icon=":material/history:",
+        ):
+            history = st.session_state.engine.annotator.history
+            st.caption(tr(
+                f"当前版本 v{st.session_state.engine.annotator.version} · 标注人员 "
+                f"{st.session_state.engine.annotator.annotator}",
+                f"Current version v{st.session_state.engine.annotator.version} · Annotator "
+                f"{st.session_state.engine.annotator.annotator}",
+            ))
+            if history:
+                st.dataframe(
+                    pd.DataFrame(history).sort_values("version", ascending=False),
+                    use_container_width=True, hide_index=True,
+                )
+            else:
+                st.info(tr("尚无修改记录", "No changes recorded yet"))
 
         # LLM 辅助预判
         st.divider()
@@ -2405,6 +2797,9 @@ with tab_annotate:
                     iv = st.session_state.engine.annotator.add_interval(
                         sel[0], sel[1], result["label"], df,
                         group=selected_group,
+                        layer="planned",
+                        source="llm",
+                        confidence=float(result.get("confidence", 0.0)),
                     )
                     remember_annotation(iv)
                     st.session_state.intervals = (
@@ -2450,7 +2845,10 @@ with tab_annotate:
                     cols[1].markdown(
                         f'`{iv.get("group", st.session_state.schema.default_label_group())}` · '
                         f'{iv["label"]} · {iv.get("frame_count", "?")} '
-                        f'{tr("帧", "frames")}'
+                        f'{tr("帧", "frames")}  \n'
+                        f'`{iv.get("layer", "verified")}` · '
+                        f'{iv.get("source", "manual")} · '
+                        f'{iv.get("annotator", "unknown")} · v{iv.get("version", 0)}'
                     )
                     if cols[2].button(tr("跳转", "Go"), key=f"jump_{i}", icon=":material/play_arrow:"):
                         st.session_state.playhead_time = iv["start_time"]
@@ -2527,6 +2925,51 @@ with tab_export:
         st.subheader(tr("数据预览", "Data preview"))
         labeled_df = st.session_state.engine.annotator.apply_to_dataframe(df)
         st.dataframe(labeled_df.head(30), use_container_width=True)
+
+        st.divider()
+
+        st.subheader(tr("训练字段与数据平衡", "Training fields and balance"))
+        training_table = TrainingExporter.build_frame_table(
+            df,
+            st.session_state.engine.annotator,
+            st.session_state.schema,
+            st.session_state.get("session_metadata", {}),
+        )
+        training_controls = st.columns([2, 1], vertical_alignment="bottom")
+        balance_dimension = training_controls[0].selectbox(
+            tr("类别统计字段", "Class field"),
+            ["terrain", "surface", "action", "gait_phase"],
+            format_func=lambda value: {
+                "terrain": tr("地形", "Terrain"),
+                "surface": tr("表面", "Surface"),
+                "action": tr("动作", "Action"),
+                "gait_phase": tr("步态阶段", "Gait phase"),
+            }[value],
+            key="training_balance_dimension",
+        )
+        training_controls[1].download_button(
+            tr("下载训练 CSV", "Download training CSV"),
+            data=training_table.to_csv(index=False).encode("utf-8-sig"),
+            file_name=(
+                f"training_{st.session_state.get('active_session_id') or 'dataset'}.csv"
+            ),
+            mime="text/csv",
+            icon=":material/model_training:",
+            type="primary",
+            use_container_width=True,
+        )
+        balance_report = TrainingExporter.balance_report(
+            training_table, balance_dimension
+        )
+        if not balance_report.empty:
+            st.dataframe(balance_report, use_container_width=True, hide_index=True)
+            if (balance_report["status"] == "imbalanced").any():
+                st.warning(tr(
+                    "存在低于最大分组 50% 的数据分组，建议补采或在训练时使用重采样/类别权重。",
+                    "Some groups contain less than 50% of the largest group; consider more data, resampling, or class weights.",
+                ))
+        with st.expander(tr("训练字段预览", "Training field preview")):
+            st.dataframe(training_table.head(30), use_container_width=True)
 
         st.divider()
 

@@ -9,6 +9,16 @@ the application.
 
 ## Highlights
 
+- Batch-import datasets by `session_id` from a long-form CSV manifest or a ZIP
+  package, then align RGB, depth, and numeric sensors on one shared timeline.
+- Store `planned_label` and `verified_label` separately. Effective training
+  labels prefer verified annotations and fall back to planned annotations.
+- Copy video-level labels to a full Session and record start, confirm, stop,
+  and cancel events at the playhead.
+- Mark terrain/surface boundaries plus validity and quality-anomaly intervals.
+- Generate planned foot-contact and gait-phase annotations from FSR signals.
+- Audit edits with annotator, source, confidence, version, and change history.
+- Export stable training fields and inspect balance by class, subject, and scene.
 - Align RGB-D images and numeric sensors sampled at different frequencies to a
   configurable master timeline.
 - Correct device clock offsets using detected physical impact peaks.
@@ -58,32 +68,53 @@ run:
 conda run -n python3.10 python generate_sample_data.py
 ```
 
-The generated files are written to `data/` and match the default schema in
-`config/sensors_schema.yaml`.
+The generated files are written to `data/`, match the default schema in
+`config/sensors_schema.yaml`, and include `data/session_manifest.csv` for the
+Session workflow.
 
 ## Typical Workflow
 
 1. Import or edit a sensor schema and select the master device.
-2. Load configured files, upload CSV/image ZIP files, or generate demo data.
-3. Align all device timestamps to the master track. Apply impact-peak clock
-   correction when required.
+2. Download the manifest template from **Sessions**, fill one row per device,
+   and import the CSV or a ZIP containing the manifest and referenced files.
+3. Enter the annotator ID, select a Session, and load it onto the shared master
+   timeline. Apply impact-peak clock correction when required.
 4. Inspect individual frames and synchronized sensor values.
-5. Run change-point detection and select a time range on the multi-track
-   timeline, or set in/out points with `I` and `O`.
-6. Select a label group and apply one or more labels. Single-frame ranges are
-   supported.
-7. Review gaps, short intervals, and single-select overlaps in the quality
-   queue. Save a JSON draft during longer sessions.
-8. Export HDF5, Master CSV plus interval JSON, or the current YAML schema.
+5. Select a time range on the multi-track timeline, or set in/out points with
+   `I` and `O`.
+6. Select a planned or verified layer and apply interval labels. Copy a label
+   across the full Session or add operation events at the playhead when needed.
+7. Generate gait and missing-data prelabels, then verify planned intervals.
+8. Review gaps and edit history. Export the direct training CSV after checking
+   class, subject, and scene balance, or export HDF5/Master CSV/Schema.
+
+## Session Manifest
+
+The manifest is a long-form CSV with one `session_id + device` per row. Required
+columns are `session_id`, `subject_id`, `scene_id`, `device`, and `data_path`.
+Optional columns are `timestamp_file`, `depth_path`, and `planned_label`.
+Relative paths are resolved from the manifest directory. Device names must
+exist in the active sensor schema.
+
+## Training Export
+
+The training CSV contains session metadata, frame/timestamp fields, RGB/depth
+paths, planned/verified/effective fields for terrain, surface, action, gait,
+events, validity, and quality, foot-contact flags, terrain/surface boundaries,
+four operation-event flags, annotation version/annotator, and raw sensor fields
+prefixed with `sensor__`.
 
 ## Grouped Labels
 
-The default schema demonstrates four groups:
+The default schema demonstrates seven groups:
 
 - `地形` (terrain), single-select
+- `表面` (surface), single-select
 - `动作` (action), single-select
 - `步态阶段` (gait phase), single-select
-- `事件` (event), multi-select
+- `操作事件` (operation event), multi-select
+- `有效性` (validity), single-select
+- `质量异常` (quality anomaly), multi-select
 
 CSV exports contain one string column per group, such as `label__地形` and
 `label__事件`. Multi-select values use `|` as a separator. HDF5 exports store
@@ -107,9 +138,9 @@ conda run -n python3.10 python -m unittest -v
 ```
 
 The test suite covers schema compatibility and validation, timestamp parsing,
-master-track alignment, impact-peak correction, grouped multi-label behavior,
-atomic draft restoration, quality checks, boundary labels, and HDF5 label
-encoding.
+master-track alignment, Session manifest validation, planned/verified layers,
+history, gait/quality prelabels, stable training fields, balance reports, atomic
+draft restoration, quality checks, and HDF5 label encoding.
 
 ## Documentation
 

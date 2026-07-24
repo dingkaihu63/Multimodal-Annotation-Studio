@@ -217,6 +217,34 @@ def generate_all(duration: float = 10.0):
     generate_fsr(duration, 100.0)
     generate_imu(duration, 200.0)
     generate_ultrasonic(duration, 50.0)
+    manifest = pd.DataFrame([
+        {
+            "session_id": "DEMO001", "subject_id": "P001",
+            "scene_id": "lab", "device": "rgbd_camera",
+            "data_path": "data/rgb", "timestamp_file": "data/rgb_timestamps.csv",
+            "depth_path": "data/depth", "planned_label": "",
+        },
+        {
+            "session_id": "DEMO001", "subject_id": "P001",
+            "scene_id": "lab", "device": "fsr_insole",
+            "data_path": "data/fsr_insole.csv", "timestamp_file": "",
+            "depth_path": "", "planned_label": "",
+        },
+        {
+            "session_id": "DEMO001", "subject_id": "P001",
+            "scene_id": "lab", "device": "imu_thigh",
+            "data_path": "data/imu_thigh.csv", "timestamp_file": "",
+            "depth_path": "", "planned_label": "",
+        },
+        {
+            "session_id": "DEMO001", "subject_id": "P001",
+            "scene_id": "lab", "device": "ultrasonic",
+            "data_path": "data/ultrasonic.csv", "timestamp_file": "",
+            "depth_path": "", "planned_label": "",
+        },
+    ])
+    manifest_path = os.path.join(BASE_DIR, "session_manifest.csv")
+    manifest.to_csv(manifest_path, index=False, encoding="utf-8-sig")
     print("=" * 50)
     print(f"[OK] 全部完成! 数据保存在 {BASE_DIR}/ 目录")
     print(f"  - RGB 图像: {RGB_DIR}/ ({int(duration*30)} 帧)")
@@ -225,6 +253,7 @@ def generate_all(duration: float = 10.0):
     print(f"  - fsr_insole.csv (100Hz)")
     print(f"  - imu_thigh.csv (200Hz)")
     print(f"  - ultrasonic.csv (50Hz)")
+    print(f"  - session_manifest.csv (Session 批量导入清单)")
     print("=" * 50)
 
 
